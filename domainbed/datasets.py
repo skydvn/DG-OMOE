@@ -124,7 +124,18 @@ class ColoredMNIST(MultipleEnvironmentMNIST):
     ENVIRONMENTS = ['+90%', '+80%', '-90%']
 
     def __init__(self, root, test_envs, hparams):
-        super(ColoredMNIST, self).__init__(root, [0.1, 0.2, 0.9],
+        num_domains = int(hparams.get('cmnist_num_domains', 3))
+        if num_domains == 3:
+            environments = [0.1, 0.2, 0.9]
+            self.ENVIRONMENTS = ['+90%', '+80%', '-90%']
+        elif num_domains >= 2:
+            environments = np.linspace(0.05, 1.00, num_domains).tolist()
+            self.ENVIRONMENTS = ['{:.2f}'.format(p) for p in environments]
+        else:
+            raise ValueError(
+                f"cmnist_num_domains must be >= 2, got {num_domains}")
+
+        super(ColoredMNIST, self).__init__(root, environments,
                                            self.color_dataset, (2, 28, 28,), 2)
 
         self.input_shape = (2, 28, 28,)

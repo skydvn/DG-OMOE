@@ -1307,12 +1307,28 @@ class GMoEVariantBase(nn.Module):
 
     def _forward(self, x):
         """Returns (logits, pi, h_stack)."""
+        x = self._preprocess(x)
         z = self.featurizer(x)
         return self.moe_head(z)
 
     def predict(self, x):
         logits, _, _ = self._forward(x)
         return logits
+
+    def _preprocess(self, x):
+        """Adapt small CMNIST tensors to the DeiT backbone input contract."""
+        if x.shape[1] != 3:
+            if x.shape[1] == 1:
+                x = x.repeat(1, 3, 1, 1)
+            elif x.shape[1] == 2:
+                ch_mean = x.mean(dim=1, keepdim=True)
+                x = torch.cat([x, ch_mean], dim=1)
+            else:
+                x = x[:, :3, :, :]
+        if x.shape[2] != 224 or x.shape[3] != 224:
+            x = F.interpolate(
+                x, size=(224, 224), mode='bilinear', align_corners=False)
+        return x
 
     def _get_domain_ids(self, minibatches):
         """Build a (B,) domain-index tensor aligned with the concatenated batch."""
@@ -1321,6 +1337,55 @@ class GMoEVariantBase(nn.Module):
             for d, (x, _) in enumerate(minibatches)
         ]
         return torch.cat(ids).to(minibatches[0][0].device)
+
+    def _routing_diagnostics(self, pi, h_stack, dom_id):
+        """Return scalar routing diagnostics for the current minibatch."""
+        with torch.no_grad():
+            eps = 1e-8
+            routing_ent = -(pi * (pi + eps).log()).sum(dim=-1).mean()
+
+            load = pi.mean(dim=0)
+            load_std = load.std(unbiased=False)
+
+            num_experts = h_stack.size(1)
+            if num_experts > 1:
+                h_norm = F.normalize(h_stack, dim=-1)
+                cos = torch.bmm(h_norm, h_norm.transpose(1, 2))
+                offdiag = ~torch.eye(
+                    num_experts, dtype=torch.bool, device=h_stack.device)
+                offdiag_cos = cos[:, offdiag].mean()
+            else:
+                offdiag_cos = h_stack.new_tensor(0.0)
+
+            domain_routes = []
+            for d in range(self.num_domains):
+                mask = (dom_id == d)
+                if mask.any():
+                    p = pi[mask].mean(dim=0)
+                    domain_routes.append(p / p.sum().clamp_min(eps))
+
+            if len(domain_routes) > 1:
+                js_vals = []
+                for i in range(len(domain_routes)):
+                    for j in range(i + 1, len(domain_routes)):
+                        p = domain_routes[i].clamp_min(eps)
+                        q = domain_routes[j].clamp_min(eps)
+                        m = 0.5 * (p + q)
+                        js = 0.5 * (
+                            (p * (p / m).log()).sum()
+                            + (q * (q / m).log()).sum()
+                        )
+                        js_vals.append(js)
+                routing_js = torch.stack(js_vals).mean()
+            else:
+                routing_js = pi.new_tensor(0.0)
+
+        return {
+            'routing_ent': routing_ent.item(),
+            'load_std': load_std.item(),
+            'offdiag_cos': offdiag_cos.item(),
+            'routing_js': routing_js.item(),
+        }
 
     def update(self, minibatches, unlabeled=None):
         raise NotImplementedError
@@ -1472,6 +1537,10 @@ class GMOE_Full(GMoEVariantBase):
         self.lambda_sp  = hparams.get('lambda_sp',  0.01)
         self.lambda_bal = hparams.get('lambda_bal', 0.01)
         self.lambda_div = hparams.get('lambda_div', 0.01)
+        self.lambda_bal = 0
+        self.lambda_div = 0
+        self.lambda_sp = 0
+        self.lambda_inv = 0
 
         # --- resolve inv_type (with legacy use_inv_b shim) ---
         inv_type = hparams.get('inv_type', 'A')
@@ -1563,12 +1632,56 @@ class GMOE_Full(GMoEVariantBase):
 # GMOE_InvMMD — conditional MMD
 # ---------------------------------------------------------------------------
 
+# class GMOE_InvMMD(GMoEVariantBase):
+#     """
+#     L = L_cls + lambda_inv * L_inv^MMD
+
+#     Hparams:
+#         lambda_inv (float, default 0.1)
+#         alpha      (float, default 4.0)   routing-weight temperature
+#         mmd_sigmas (tuple,  default (1,2,4,8,16))
+#     """
+
+#     def __init__(self, input_shape, num_classes, num_domains, hparams):
+#         super().__init__(input_shape, num_classes, num_domains, hparams)
+#         self.lambda_inv = hparams.get('lambda_inv', 0.1)
+#         self.alpha = hparams.get('alpha', 4.0)
+#         self.sigmas = tuple(hparams.get('mmd_sigmas', (1., 2., 4., 8., 16.)))
+
+#     def update(self, minibatches, unlabeled=None):
+#         all_x = torch.cat([x for x, y in minibatches])
+#         all_y = torch.cat([y for x, y in minibatches])
+#         dom_id = self._get_domain_ids(minibatches)
+
+#         logits, pi, h_stack = self._forward(all_x)
+
+#         l_cls = F.cross_entropy(logits, all_y)
+#         l_inv = loss_inv_MMD(h_stack, pi, all_y, self.num_classes,
+#                              dom_id, self.num_domains,
+#                              alpha=self.alpha, sigmas=self.sigmas)
+#         loss = l_cls + self.lambda_inv * l_inv
+
+#         self.optimizer.zero_grad()
+#         loss.backward()
+#         self.optimizer.step()
+
+#         return {'loss': loss.item(), 'loss_cls': l_cls.item(), 'loss_inv': l_inv.item()}
+
 class GMOE_InvMMD(GMoEVariantBase):
     """
-    L = L_cls + lambda_inv * L_inv^MMD
+    L = L_cls
+      + lambda_inv * L_inv^MMD
+      + lambda_sp  * L_sp   (sparsity / routing entropy)
+      + lambda_bal * L_bal  (load balancing)
+      + lambda_div * L_div  (expert diversity)
+
+    Note: L_cind is intentionally excluded from this variant.
 
     Hparams:
         lambda_inv (float, default 0.1)
+        lambda_sp  (float, default 0.01)
+        lambda_bal (float, default 0.01)
+        lambda_div (float, default 0.01)
         alpha      (float, default 4.0)   routing-weight temperature
         mmd_sigmas (tuple,  default (1,2,4,8,16))
     """
@@ -1576,6 +1689,9 @@ class GMOE_InvMMD(GMoEVariantBase):
     def __init__(self, input_shape, num_classes, num_domains, hparams):
         super().__init__(input_shape, num_classes, num_domains, hparams)
         self.lambda_inv = hparams.get('lambda_inv', 0.1)
+        self.lambda_sp  = hparams.get('lambda_sp',  0.01)
+        self.lambda_bal = hparams.get('lambda_bal', 0.01)
+        self.lambda_div = hparams.get('lambda_div', 0.01)
         self.alpha = hparams.get('alpha', 4.0)
         self.sigmas = tuple(hparams.get('mmd_sigmas', (1., 2., 4., 8., 16.)))
 
@@ -1590,13 +1706,31 @@ class GMOE_InvMMD(GMoEVariantBase):
         l_inv = loss_inv_MMD(h_stack, pi, all_y, self.num_classes,
                              dom_id, self.num_domains,
                              alpha=self.alpha, sigmas=self.sigmas)
-        loss = l_cls + self.lambda_inv * l_inv
+        l_sp  = loss_sparse(pi)
+        l_bal = loss_balance(pi)
+        l_div = loss_diversity(h_stack)
+
+        loss = (l_cls
+                + self.lambda_inv * l_inv
+                + self.lambda_sp  * l_sp
+                + self.lambda_bal * l_bal
+                + self.lambda_div * l_div)
 
         self.optimizer.zero_grad()
         loss.backward()
         self.optimizer.step()
 
-        return {'loss': loss.item(), 'loss_cls': l_cls.item(), 'loss_inv': l_inv.item()}
+        diagnostics = self._routing_diagnostics(pi, h_stack, dom_id)
+
+        return {
+            'loss':     loss.item(),
+            'loss_cls': l_cls.item(),
+            'loss_inv': l_inv.item(),
+            'loss_sp':  l_sp.item(),
+            'loss_bal': l_bal.item(),
+            'loss_div': l_div.item(),
+            **diagnostics,
+        }
 
 
 # ---------------------------------------------------------------------------

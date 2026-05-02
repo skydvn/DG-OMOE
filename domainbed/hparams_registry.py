@@ -183,7 +183,20 @@ def _hparams(algorithm, dataset, random_seed):
     elif algorithm in ['DANN', 'CDANN']:
         _hparam('weight_decay_g', 0., lambda r: 10 ** r.uniform(-6, -2))
 
-    if algorithm in ('GMOE', 'GMoEOMoE'):
+    GMOE_ALGORITHMS = (
+        'GMOE',
+        'GMoEOMoE',
+        'GMOE_OMOE',
+        'GMOE_InvA',
+        'GMOE_InvB',
+        'GMOE_Full',
+        'GMOE_InvMMD',
+        'GMOE_InvOT',
+        'GMOE_InvAdv',
+        'GMOE_InvED',
+    )
+
+    if algorithm in GMOE_ALGORITHMS:
         _hparam('num_experts',        6,                        lambda r: 6)
         _hparam('gate_k',             1,                        lambda r: 1)
         _hparam('mlp_ratio',          4.0,                      lambda r: 4.0)
@@ -192,6 +205,7 @@ def _hparams(algorithm, dataset, random_seed):
         _hparam('model',              'deit_small_patch16_224', lambda r: 'deit_small_patch16_224')
         _hparam('use_omoe',           False,                    lambda r: False)
         _hparam('use_balance_loss',   False,                    lambda r: False)
+        _hparam('cmnist_num_domains',  3,                        lambda r: 3)
 
         if dataset == 'VLCS':
             _hparam('lr', 3e-5, lambda r: 10 ** r.uniform(-4.5, -2.5))

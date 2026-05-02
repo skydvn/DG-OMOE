@@ -54,6 +54,15 @@ if __name__ == "__main__":
     parser.add_argument('--checkpoint_freq', type=int, default=None,
                         help='Checkpoint every N steps. Default is dataset-dependent.')
     parser.add_argument('--test_envs', type=int, nargs='+', default=[0])
+    parser.add_argument('--train_envs', type=int, nargs='+', default=None,
+                        help='Optional explicit list of environment indices to train on.')
+    parser.add_argument('--eval_envs', type=int, nargs='*', default=None,
+                        help='Optional explicit list of environment indices to evaluate.')
+    parser.add_argument('--max_train_examples_per_env', type=int, nargs='+',
+                        default=None,
+                        help='Optional cap(s) on in-split examples used from train envs. '
+                             'Pass one value for a shared cap, one value per train env, '
+                             'or one value per dataset env.')
     parser.add_argument('--output_dir', type=str, default="train_output")
     parser.add_argument('--holdout_fraction', type=float, default=0.2)
     parser.add_argument('--uda_holdout_fraction', type=float, default=0,
@@ -125,9 +134,46 @@ if __name__ == "__main__":
     else:
         raise NotImplementedError
 
+    if args.train_envs is None:
+        train_envs = [i for i in range(len(dataset)) if i not in args.test_envs]
+    else:
+        train_envs = args.train_envs
+
+    if len(set(train_envs).intersection(set(args.test_envs))):
+        raise ValueError("train_envs and test_envs must be disjoint.")
+
+    for env_i in train_envs + args.test_envs:
+        if env_i < 0 or env_i >= len(dataset):
+            raise ValueError("Environment index {} is out of range for {} "
+                             "environments.".format(env_i, len(dataset)))
+
+    eval_envs = args.eval_envs
+    if eval_envs is None:
+        eval_envs = list(range(len(dataset)))
+
+    for env_i in eval_envs:
+        if env_i < 0 or env_i >= len(dataset):
+            raise ValueError("Evaluation environment index {} is out of "
+                             "range for {} environments.".format(
+                                 env_i, len(dataset)))
+
+    max_train_examples_by_env = None
+    if args.max_train_examples_per_env is not None:
+        caps = args.max_train_examples_per_env
+        if len(caps) == 1:
+            max_train_examples_by_env = {env_i: caps[0] for env_i in train_envs}
+        elif len(caps) == len(train_envs):
+            max_train_examples_by_env = dict(zip(train_envs, caps))
+        elif len(caps) == len(dataset):
+            max_train_examples_by_env = {
+                env_i: caps[env_i] for env_i in train_envs}
+        else:
+            raise ValueError("max_train_examples_per_env must contain one "
+                             "value, one value per train env, or one value "
+                             "per dataset env.")
 
     if 'Debug' not in args.dataset:
-        wandb.login(key="b1d6eed8871c7668a889ae74a621b5dbd2f3b070")
+        wandb.login(key="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")
 
         _NEVER_SHOW = {
             'data_augmentation', 'resnet18', 'resnet_dropout',
@@ -145,7 +191,7 @@ if __name__ == "__main__":
 
         wandb.init(
             project='sparse-moe',
-            entity='letuanhf-hanoi-university-of-science-and-technology',
+            entity='ttdat170703-ho-chi-minh-city-university-of-technology',
             name=run_name,
             config={
                 'dataset': args.dataset,
@@ -180,6 +226,16 @@ if __name__ == "__main__":
         uda = []
 
         out, in_ = misc.split_dataset(env, int(len(env) * args.holdout_fraction), misc.seed_hash(args.trial_seed, env_i))
+
+        if (max_train_examples_by_env is not None
+                and env_i in max_train_examples_by_env
+                and len(in_) > max_train_examples_by_env[env_i]):
+            in_, _ = misc.split_dataset(
+                in_,
+                max_train_examples_by_env[env_i],
+                misc.seed_hash(args.trial_seed, args.seed, env_i,
+                               "max_train_examples_per_env"))
+
         if env_i in args.test_envs:
             uda, in_ = misc.split_dataset(in_, int(len(in_) * args.uda_holdout_fraction), misc.seed_hash(args.trial_seed, env_i))
 
@@ -204,32 +260,38 @@ if __name__ == "__main__":
         batch_size=hparams['batch_size'],
         num_workers=dataset.N_WORKERS)
         for i, (env, env_weights) in enumerate(in_splits)
-        if i not in args.test_envs]
+        if i in train_envs]
 
     uda_loaders = [InfiniteDataLoader(
         dataset=env,
         weights=env_weights,
         batch_size=hparams['batch_size'],
         num_workers=dataset.N_WORKERS)
-        for i, (env, env_weights) in enumerate(uda_splits)
-        if i in args.test_envs]
+        for env, env_weights in uda_splits]
 
+    eval_splits = [in_splits[i] for i in eval_envs]
+    eval_splits += [out_splits[i] for i in eval_envs]
     eval_loaders = [FastDataLoader(
         dataset=env,
         batch_size=64,
         num_workers=dataset.N_WORKERS)
-        for env, _ in (in_splits + out_splits + uda_splits)]
-    eval_weights = [None for _, weights in (in_splits + out_splits + uda_splits)]
-    eval_loader_names = ['env{}_in'.format(i)
-                         for i in range(len(in_splits))]
-    eval_loader_names += ['env{}_out'.format(i)
-                          for i in range(len(out_splits))]
+        for env, _ in eval_splits]
+    eval_weights = [None for _, weights in eval_splits]
+    eval_loader_names = ['env{}_in'.format(i) for i in eval_envs]
+    eval_loader_names += ['env{}_out'.format(i) for i in eval_envs]
+
+    eval_loaders += [FastDataLoader(
+        dataset=env,
+        batch_size=64,
+        num_workers=dataset.N_WORKERS)
+        for env, _ in uda_splits]
+    eval_weights += [None for _, weights in uda_splits]
     eval_loader_names += ['env{}_uda'.format(i)
                           for i in range(len(uda_splits))]
 
     algorithm_class = algorithms.get_algorithm_class(args.algorithm)
     algorithm = algorithm_class(dataset.input_shape, dataset.num_classes,
-                                len(dataset) - len(args.test_envs), hparams)
+                                len(train_envs), hparams)
 
     if algorithm_dict is not None:
         algorithm.load_state_dict(algorithm_dict)
@@ -254,7 +316,8 @@ if __name__ == "__main__":
     uda_minibatches_iterator = zip(*uda_loaders)
     checkpoint_vals = collections.defaultdict(lambda: [])
 
-    steps_per_epoch = min([len(env) / hparams['batch_size'] for env, _ in in_splits])
+    steps_per_epoch = min(
+        [len(in_splits[i][0]) / hparams['batch_size'] for i in train_envs])
 
     n_steps = args.steps or dataset.N_STEPS
     checkpoint_freq = args.checkpoint_freq or dataset.CHECKPOINT_FREQ
@@ -267,7 +330,7 @@ if __name__ == "__main__":
             "args": vars(args),
             "model_input_shape": dataset.input_shape,
             "model_num_classes": dataset.num_classes,
-            "model_num_domains": len(dataset) - len(args.test_envs),
+            "model_num_domains": len(train_envs),
             "model_hparams": hparams,
             "model_dict": algorithm.state_dict()
         }
@@ -324,6 +387,25 @@ if __name__ == "__main__":
             epochs_path = os.path.join(args.output_dir, 'results.jsonl')
             with open(epochs_path, 'a') as f:
                 f.write(json.dumps(results, sort_keys=True) + "\n")
+
+            routing_diag_keys = {
+                'Routing Ent': 'routing_ent',
+                'Load Std': 'load_std',
+                'Offdiag Cos': 'offdiag_cos',
+                'Routing JS': 'routing_js',
+            }
+            if all(src in results for src in routing_diag_keys.values()):
+                diag_record = {
+                    'step': step,
+                    'epoch': results['epoch'],
+                    **{
+                        label: float(results[src])
+                        for label, src in routing_diag_keys.items()
+                    },
+                }
+                diag_path = os.path.join(args.output_dir, 'routing_diagnostics.jsonl')
+                with open(diag_path, 'a') as f:
+                    f.write(json.dumps(diag_record, sort_keys=True) + "\n")
 
             if sweep_logger is not None:
                 avg_step_vals = {k: float(np.mean(v)) for k, v in checkpoint_vals.items()}
