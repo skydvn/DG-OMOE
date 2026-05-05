@@ -323,6 +323,8 @@ class DeepMoELayer(nn.Module):
         self.gate_proj = nn.Linear(model_dim, num_experts, bias=False)
         # Mirrors tutel's l_aux attribute; value set during forward
         self.l_aux = torch.tensor(0.0)
+        self.routing_scores = None
+        self.expert_outputs = None
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: (B, S, D)
@@ -332,6 +334,7 @@ class DeepMoELayer(nn.Module):
 
         # Cosine top-k routing (topk returns descending order: ki=0 = highest-weight expert)
         logits             = self.gate_proj(F.normalize(x_flat, dim=-1))   # (T, E)
+        self.routing_scores = F.softmax(logits, dim=-1)                    # (T, E)
         topk_vals, topk_idx = logits.topk(self.gate_k, dim=-1)             # (T, k)
         gates              = F.softmax(topk_vals, dim=-1)                  # (T, k)
 
@@ -350,6 +353,14 @@ class DeepMoELayer(nn.Module):
 
         # Weighted aggregation
         out = (gates.unsqueeze(-1) * E_raw).sum(dim=1)                     # (T, D)
+        expert_outputs = torch.zeros(T, self.num_experts, D, device=x.device, dtype=x.dtype)
+        for ki in range(self.gate_k):
+            expert_outputs.scatter_add_(
+                1,
+                topk_idx[:, ki].view(T, 1, 1).expand(T, 1, D),
+                E_raw[:, ki:ki + 1, :],
+            )
+        self.expert_outputs = expert_outputs
 
         # Optional load-balance auxiliary loss (importance CV²)
         if self.use_balance_loss:
@@ -418,10 +429,17 @@ class Block(nn.Module):
             return attn
         if self.cur_layer == 'S':
             x = x + self.drop_path(self.attn(self.norm1(x)))
-            x = x + self.drop_path(self.mlp(self.norm2(x)))
+            moe_input = self.norm2(x)
+            tutel_routing_scores = None
+            if hasattr(self.mlp, 'gates'):
+                gate_input = moe_input.reshape(-1, moe_input.shape[-1])
+                tutel_routing_scores = F.softmax(self.mlp.gates[0](gate_input), dim=1)
+            x = x + self.drop_path(self.mlp(moe_input))
             self.aux_loss = self.mlp.l_aux * self.aux_loss_weights
             # TransparentMoELayer exposes these; Tutel path leaves them None
             self.routing_scores = getattr(self.mlp, 'routing_scores', None)
+            if self.routing_scores is None:
+                self.routing_scores = tutel_routing_scores
             self.expert_outputs = getattr(self.mlp, 'expert_outputs', None)
             return x
         elif self.cur_layer == 'F':

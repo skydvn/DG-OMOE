@@ -35,6 +35,10 @@ from domainbed.losses.gmoe_utils import *
 from domainbed.deit_transformer import *
 
 
+def _default_device():
+    return torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+
 ALGORITHMS = [
     'ERM',
     'Fish',
@@ -695,8 +699,9 @@ class GMOE(Algorithm):
         prune_ratio  = hparams.get('expert_prune_ratio', 0.0)
         expert_depth = hparams.get('expert_depth',      2)
         model_name   = hparams.get('model',             'deit_small_patch16_224')
+        force_custom_moe = hparams.get('force_custom_moe', False)
         model_factory = getattr(vision_transformer, model_name)
-        self.model = model_factory(pretrained=True, num_classes=num_classes, moe_layers=['F'] * 8 + ['S', 'F'] * 2, mlp_ratio=4.0, expert_mlp_ratio=mlp_ratio, num_experts=num_experts, gate_k=gate_k, prune_ratio=prune_ratio, is_tutel=True, drop_path_rate=0.1, router='cosine_top', expert_depth=expert_depth).cuda()
+        self.model = model_factory(pretrained=True, num_classes=num_classes, moe_layers=['F'] * 8 + ['S', 'F'] * 2, mlp_ratio=4.0, expert_mlp_ratio=mlp_ratio, num_experts=num_experts, gate_k=gate_k, prune_ratio=prune_ratio, is_tutel=True, drop_path_rate=0.1, router='cosine_top', expert_depth=expert_depth, force_custom_moe=force_custom_moe).to(_default_device())
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=self.hparams["lr"], weight_decay=self.hparams['weight_decay'])
         self.ortho_loss_fn = OrthoLoss()
         self.variance_loss_fn = VarianceLoss()
@@ -750,16 +755,38 @@ class GMOE(Algorithm):
             'loss_variance':  variance_loss.item(),
         }
 
-    def predict(self, x, forward_feature=False):
+    def _last_router_probs(self):
+        """Return image-level routing probabilities from the last MoE block."""
+        for block in reversed(getattr(self.model, 'blocks', [])):
+            probs = getattr(block, 'routing_scores', None)
+            if probs is None:
+                continue
+            if probs.dim() == 3:
+                probs = probs.mean(dim=1)
+            elif probs.dim() == 2:
+                batch_size = getattr(self.model, '_last_batch_size', None)
+                if batch_size is not None and probs.size(0) % batch_size == 0:
+                    probs = probs.reshape(batch_size, -1, probs.size(-1)).mean(dim=1)
+            return probs
+        return None
+
+    def predict(self, x, forward_feature=False, return_router=False):
         x = self._preprocess(x)
+        self.model._last_batch_size = x.size(0)
         if forward_feature:
-            return self.model.forward_features(x)
+            output = self.model.forward_features(x)
+            if return_router:
+                return output, {'router_probs': self._last_router_probs()}
+            return output
+
+        prediction = self.model(x)
+        if type(prediction) is tuple:
+            logits = (prediction[0] + prediction[1]) / 2
         else:
-            prediction = self.model(x)
-            if type(prediction) is tuple:
-                return (prediction[0] + prediction[1]) / 2
-            else:
-                return prediction
+            logits = prediction
+        if return_router:
+            return logits, {'router_probs': self._last_router_probs()}
+        return logits
 
 
 class GMoEOMoE(GMOE):
@@ -800,7 +827,7 @@ class GMoEOMoE(GMOE):
             force_custom_moe=True,
             use_omoe=use_omoe,
             use_balance_loss=use_balance_loss,
-        ).cuda()
+        ).to(_default_device())
         self.optimizer = torch.optim.Adam(
             self.model.parameters(),
             lr=self.hparams["lr"],
@@ -1214,7 +1241,7 @@ class GMoEVariantBase(nn.Module):
         self.featurizer = DeiTFeaturizer(
             model_name=model_name,
             pretrained=True,
-        ).cuda()
+        ).to(_default_device())
 
         # Optional freeze — disables gradients on backbone params and forces
         # eval mode so BatchNorm / Dropout stats don't drift.  Params with
@@ -1241,7 +1268,7 @@ class GMoEVariantBase(nn.Module):
             mlp_ratio=mlp_ratio,
             prune_ratio=prune_ratio,
             expert_depth=expert_depth,
-        ).cuda()
+        ).to(_default_device())
 
         self.optimizer = torch.optim.Adam(
             list(self.featurizer.parameters()) + list(self.moe_head.parameters()),
@@ -1305,13 +1332,18 @@ class GMoEVariantBase(nn.Module):
         print(f'  ─────────────────────────────────────────────')
         print(f'  TOTAL                  : {fmt(total_t)}  trainable={fmt(total_tr)}\n')
 
-    def _forward(self, x):
+    def _forward(self, x, return_router=False):
         """Returns (logits, pi, h_stack)."""
         x = self._preprocess(x)
         z = self.featurizer(x)
-        return self.moe_head(z)
+        logits, pi, h_stack = self.moe_head(z)
+        if return_router:
+            return logits, {'router_probs': pi}
+        return logits, pi, h_stack
 
-    def predict(self, x):
+    def predict(self, x, return_router=False):
+        if return_router:
+            return self._forward(x, return_router=True)
         logits, _, _ = self._forward(x)
         return logits
 
@@ -1540,7 +1572,7 @@ class GMOE_Full(GMoEVariantBase):
         self.lambda_bal = 0
         self.lambda_div = 0
         self.lambda_sp = 0
-        self.lambda_inv = 0
+        # self.lambda_inv = 0
 
         # --- resolve inv_type (with legacy use_inv_b shim) ---
         inv_type = hparams.get('inv_type', 'A')
